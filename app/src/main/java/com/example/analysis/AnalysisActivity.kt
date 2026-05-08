@@ -23,6 +23,18 @@ import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.sqrt
 
+/**
+ * 子序列 DTW
+ * 在 patientSeq 中找到与 doctorSeq 最匹配的一段
+ * 返回：最优对齐的平均角度差 + 患者序列的起止帧索引
+ */
+data class SubDTWResult(
+    val avgAngleDiff: Float,   // 平均角度差（°）
+    val patientStart: Int,     // 患者最优起始帧
+    val patientEnd: Int        // 患者最优结束帧
+)
+
+
 class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListener {
 
     // ── UI ───────────────────────────────────────────────────────────────────
@@ -54,7 +66,7 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     private var analysisThreadPatient: HandlerThread? = null
 
     // ── 降帧控制（两路各自记录上次处理时间）──────────────────────────────────
-    private val FRAME_INTERVAL_MS = 50L   // 每200ms处理一帧 ≈ 5fps，可按需调整
+    private val FRAME_INTERVAL_MS = 100L   // 每100ms处理一帧 ≈ 10fps，可按需调整
     private var lastFrameTimeDoctor = 0L
     private var lastFrameTimePatient = 0L
 
@@ -67,7 +79,7 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     val doctorPoseList = mutableListOf<List<NormalizedLandmark>>()
     val patientPoseList = mutableListOf<List<NormalizedLandmark>>()
 
-    var endedCount=0
+    var endedCount = 0
 
     private val pickVideo =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
@@ -242,7 +254,9 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                 }
                 helper ?: return@setOnImageAvailableListener
 
-                val bitmap = image.toBitmap()
+                val bitmap = image.toBitmapScaled(targetWidth = 256)
+                val timestampUs = image.timestamp / 1000
+
                 helper.detectVideoFrame(bitmap, System.currentTimeMillis())?.let { result ->
                     val landmarks = result.results[0].landmarks()
                     if (landmarks.isNotEmpty()) {
@@ -290,8 +304,8 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                             if (state == androidx.media3.common.Player.STATE_ENDED) {
                                 endedCount++
                                 if (endedCount == 2) {  // 两路都结束
-                                    val score = calculateScore(doctorPoseList, patientPoseList)
-                                    Log.d("mmmmm",""+score)
+                                    val score = calculateScoreDTW(doctorPoseList, patientPoseList)
+                                    Log.d("mmmmm", "" + score)
                                 }
                                 imageReader.close()
                                 analysisThread.quitSafely()
@@ -316,37 +330,10 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         }
     }
 
-
-    fun alignSequences(
-        a: List<List<NormalizedLandmark>>,
-        b: List<List<NormalizedLandmark>>
-    ): Pair<List<List<NormalizedLandmark>>, List<List<NormalizedLandmark>>> {
-        val targetSize = minOf(a.size, b.size)
-        fun resample(src: List<List<NormalizedLandmark>>): List<List<NormalizedLandmark>> {
-            return List(targetSize) { i ->
-                val srcIdx = (i.toFloat() / targetSize * src.size).toInt().coerceIn(0, src.size - 1)
-                src[srcIdx]
-            }
-        }
-        return resample(a) to resample(b)
-    }
-
-    // 计算三点夹角（角度）
-    fun angle(a: NormalizedLandmark, b: NormalizedLandmark, c: NormalizedLandmark): Float {
-        val v1x = a.x() - b.x();
-        val v1y = a.y() - b.y()
-        val v2x = c.x() - b.x();
-        val v2y = c.y() - b.y()
-        val dot = v1x * v2x + v1y * v2y
-        val mag = sqrt((v1x * v1x + v1y * v1y) * (v2x * v2x + v2y * v2y))
-        return Math.toDegrees(acos((dot / mag).coerceIn(-1f, 1f).toDouble())).toFloat()
-    }
-
-    // 计算一帧的相似度（0~1）
-    fun frameSimilarity(
-        d: List<NormalizedLandmark>,
-        p: List<NormalizedLandmark>
-    ): Float {
+    /**
+     * 把一帧 landmarks 提取为关节角度向量
+     */
+    fun extractAngleVector(frame: List<NormalizedLandmark>): FloatArray {
         val joints = listOf(
             // ── 手臂 ──────────────────────────────────────────────────────────────────
             Triple(11, 13, 15), // 左肘角：左肩-左肘-左腕（手臂弯曲程度）
@@ -373,78 +360,325 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
 //            Triple(12, 11,  0), // 颈部角：右肩-左肩-鼻子（头部左右偏）
 
             // ── 下半身（如需要可开启）────────────────────────────────────────────────
-             Triple(23, 25, 27), // 左膝角：左髋-左膝-左踝（膝盖弯曲程度）
-             Triple(24, 26, 28), // 右膝角：右髋-右膝-右踝（膝盖弯曲程度）
-             Triple(11, 23, 25), // 左髋角：左肩-左髋-左膝（髋部弯曲程度）
-             Triple(12, 24, 26), // 右髋角：右肩-右髋-右膝（髋部弯曲程度）
+            Triple(23, 25, 27), // 左膝角：左髋-左膝-左踝（膝盖弯曲程度）
+            Triple(24, 26, 28), // 右膝角：右髋-右膝-右踝（膝盖弯曲程度）
+            Triple(11, 23, 25), // 左髋角：左肩-左髋-左膝（髋部弯曲程度）
+            Triple(12, 24, 26), // 右髋角：右肩-右髋-右膝（髋部弯曲程度）
 //             Triple(25, 27, 31), // 左踝角：左膝-左踝-左脚尖（踝关节角度）
 //             Triple(26, 28, 32), // 右踝角：右膝-右踝-右脚尖（踝关节角度）
         )
-        val diffs = joints.map { (a, b, c) ->
-            val angleD = angle(d[a], d[b], d[c])
-            val angleP = angle(p[a], p[b], p[c])
-            abs(angleD - angleP).coerceAtMost(90f) // 超过90°都算最大差异
+        return FloatArray(joints.size) { i ->
+            val (a, b, c) = joints[i]
+            angle(frame[a], frame[b], frame[c])
         }
-        val avgDiff = diffs.average().toFloat()
-        return (1f - avgDiff / 60f).coerceIn(0f, 1f)
     }
 
-    fun calculateScore(
+    /**
+     * 两个角度向量之间的距离（单位：度）
+     */
+    fun vectorDistance(v1: FloatArray, v2: FloatArray): Float {
+        var sum = 0f
+        for (i in v1.indices) {
+            val diff = abs(v1[i] - v2[i]).coerceAtMost(90f)
+            sum += diff
+        }
+        return sum / v1.size  // 平均角度差（°）
+    }
+
+
+    /**
+     * 带 Sakoe-Chiba Band 约束的 DTW（防止过度弯曲，提升性能）
+     * windowRatio: 允许的最大时间偏移比例，推荐 0.1~0.2
+     */
+    fun dtwWithWindow(
+        seq1: List<FloatArray>,
+        seq2: List<FloatArray>,
+        windowRatio: Float = 0.15f
+    ): Float {
+        val n = seq1.size
+        val m = seq2.size
+        val window = (maxOf(n, m) * windowRatio).toInt().coerceAtLeast(1)
+
+        val dp = Array(n + 1) { FloatArray(m + 1) { Float.MAX_VALUE } }
+        dp[0][0] = 0f
+
+        for (i in 1..n) {
+            // Band 约束：j 的范围限制在窗口内
+            val jStart = maxOf(1, i - window)
+            val jEnd = minOf(m, i + window)
+            for (j in jStart..jEnd) {
+                val cost = vectorDistance(seq1[i - 1], seq2[j - 1])
+                val minPrev = minOf(
+                    dp[i - 1][j],
+                    dp[i][j - 1],
+                    dp[i - 1][j - 1]
+                )
+                if (minPrev < Float.MAX_VALUE) {
+                    dp[i][j] = cost + minPrev
+                }
+            }
+        }
+
+        // 归一化：除以对角路径长度
+        val pathLen = (n + m).toFloat()
+        return dp[n][m] / pathLen
+    }
+
+
+    //    /**
+//     * 最终评分入口
+//     */
+//    fun calculateScoreDTW(
+//        doctorList: List<List<NormalizedLandmark>>,
+//        patientList: List<List<NormalizedLandmark>>
+//    ): Int {
+//        // 1. 提取角度序列
+//        val seq1 = doctorList.map { extractAngleVector(it) }
+//        val seq2 = patientList.map { extractAngleVector(it) }
+//
+//        // 2. 计算 DTW 归一化距离（单位：平均角度差°）
+//        val avgAngleDiff = dtwWithWindow(seq1, seq2, windowRatio = 0.15f)
+//
+//        // 3. 映射到分数
+//        //    avgAngleDiff = 0°  → 100分（完美）
+//        //    avgAngleDiff = 30° → 0分（差异很大）
+//        //    可根据实际数据调整 maxDiff
+//        val maxDiff = 30f
+//        val score = ((1f - avgAngleDiff / maxDiff) * 100f)
+//            .coerceIn(0f, 100f)
+//            .toInt()
+//
+//        return score
+//    }
+    fun calculateScoreDTW(
         doctorList: List<List<NormalizedLandmark>>,
         patientList: List<List<NormalizedLandmark>>
     ): Int {
-        val (aligned1, aligned2) = alignSequences(doctorList, patientList)
-        val avgSimilarity = aligned1.zip(aligned2)
-            .map { (d, p) -> frameSimilarity(d, p) }
-            .average()
+        if (doctorList.isEmpty() || patientList.isEmpty()) return 0
 
-        // 平方惩罚：相似度越低，分数下降越快
-        // 例如：相似度0.9 → 81分，相似度0.7 → 49分，相似度0.5 → 25分
-        //val score = (avgSimilarity * avgSimilarity * 100).toInt()
-        val score = (avgSimilarity  * 100).toInt()
-        return score
+        val doctorSeq = doctorList.map { extractAngleVector(it) }
+        val patientSeq = patientList.map { extractAngleVector(it) }
+
+        // 第一步：找到患者有效段
+        val subResult = subsequenceDTW(doctorSeq, patientSeq, windowRatio = 0.15f)
+        if (subResult.avgAngleDiff == Float.MAX_VALUE) return 0
+
+        // 提取患者有效段
+        val validPatientSeq = patientSeq.subList(subResult.patientStart, subResult.patientEnd)
+
+        Log.d("mmmmm", "患者有效段：第${subResult.patientStart}~${subResult.patientEnd}帧，共${validPatientSeq.size}帧")
+
+        // 第二步：按5秒切块评分
+        // 采样率 20fps（FRAME_INTERVAL_MS=50ms），5秒=100帧
+        val framesPerSegment = (5000 / FRAME_INTERVAL_MS).toInt()
+
+        val segmentScores = mutableListOf<Int>()
+        var segIndex = 0
+
+        while (true) {
+            // 医生序列的切块范围
+            val doctorStart = segIndex * framesPerSegment
+            val doctorEnd = minOf(doctorStart + framesPerSegment, doctorSeq.size)
+            if (doctorStart >= doctorSeq.size) break
+
+            // 患者有效段按比例映射到对应范围
+            // 医生第 doctorStart~doctorEnd 帧 对应 患者有效段的哪个范围
+            val ratio = validPatientSeq.size.toFloat() / doctorSeq.size
+            val patStart = (doctorStart * ratio).toInt().coerceIn(0, validPatientSeq.size)
+            val patEnd = (doctorEnd * ratio).toInt().coerceIn(0, validPatientSeq.size)
+
+            if (patStart >= patEnd || doctorStart >= doctorEnd) {
+                segIndex++
+                continue
+            }
+
+            val doctorChunk = doctorSeq.subList(doctorStart, doctorEnd)
+            val patientChunk = validPatientSeq.subList(patStart, patEnd)
+
+            // 对这段单独跑DTW评分
+            val avgDiff = dtwWithWindow(doctorChunk, patientChunk, windowRatio = 0.15f)
+            val segScore = if (avgDiff == Float.MAX_VALUE) 0
+            else ((1f - avgDiff / 30f) * 100f).coerceIn(0f, 100f).toInt()
+
+            segmentScores.add(segScore)
+
+            val segStartSec = segIndex * 5
+            val segEndSec = segStartSec + 5
+            Log.d("mmmmm", "第${segIndex + 1}段 (${segStartSec}s~${segEndSec}s): $segScore 分，角度差=%.1f°".format(avgDiff))
+
+            segIndex++
+        }
+
+        if (segmentScores.isEmpty()) return 0
+
+        // 第三步：汇总
+        val totalScore = segmentScores.average().toInt()
+        Log.d("mmmmm", "分段明细: $segmentScores")
+        Log.d("mmmmm", "最终总分: $totalScore")
+
+        return totalScore
     }
 
-    // ── YUV→Bitmap ───────────────────────────────────────────────────────────
-    private fun android.media.Image.toBitmap(): Bitmap {
-        val w = width
-        val h = height
+    // 计算三点夹角（角度）
+    fun angle(a: NormalizedLandmark, b: NormalizedLandmark, c: NormalizedLandmark): Float {
+        val v1x = a.x() - b.x();
+        val v1y = a.y() - b.y()
+        val v2x = c.x() - b.x();
+        val v2y = c.y() - b.y()
+        val dot = v1x * v2x + v1y * v2y
+        val mag = sqrt((v1x * v1x + v1y * v1y) * (v2x * v2x + v2y * v2y))
+        return Math.toDegrees(acos((dot / mag).coerceIn(-1f, 1f).toDouble())).toFloat()
+    }
+
+
+    // ── YUV→Bitmap（直接降采样转换，跳过JPEG）────────────────────────────────────
+    private fun android.media.Image.toBitmapScaled(targetWidth: Int = 256): Bitmap {
+        val srcW = width
+        val srcH = height
+
+        // 计算缩放步长：每隔 step 个像素采一次
+        val step = (srcW.toFloat() / targetWidth).coerceAtLeast(1f)
+        val dstW = (srcW / step).toInt()
+        val dstH = (srcH / step).toInt()
+
         val yPlane = planes[0]
         val uPlane = planes[1]
         val vPlane = planes[2]
 
-        // ✅ 先判断 buffer 是否为空
-        val yBuf = yPlane.buffer ?: return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val uBuf = uPlane.buffer ?: return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val vBuf = vPlane.buffer ?: return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val yBuf = yPlane.buffer
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
 
-        val yRowStride    = yPlane.rowStride
-        val uvRowStride   = uPlane.rowStride
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uPlane.rowStride
         val uvPixelStride = uPlane.pixelStride
 
-        val nv21 = ByteArray(w * h + 2 * (w / 2) * (h / 2))
+        val pixels = IntArray(dstW * dstH)
 
-        for (row in 0 until h) {
-            yBuf.position(row * yRowStride)
-            yBuf.get(nv21, row * w, w)
-        }
+        for (dstRow in 0 until dstH) {
+            val srcRow = (dstRow * step).toInt().coerceIn(0, srcH - 1)
+            for (dstCol in 0 until dstW) {
+                val srcCol = (dstCol * step).toInt().coerceIn(0, srcW - 1)
 
-        val vuBase = w * h
-        for (row in 0 until h / 2) {
-            for (col in 0 until w / 2) {
-                val srcIdx = row * uvRowStride + col * uvPixelStride
-                val dstIdx = vuBase + (row * (w / 2) + col) * 2
-                vBuf.position(srcIdx); nv21[dstIdx]     = vBuf.get()
-                uBuf.position(srcIdx); nv21[dstIdx + 1] = uBuf.get()
+                // 读 Y 分量
+                val yIdx = srcRow * yRowStride + srcCol
+                val y = yBuf.get(yIdx).toInt() and 0xFF
+
+                // 读 UV 分量（UV 是 Y 的一半分辨率）
+                val uvRow = (srcRow / 2) * uvRowStride
+                val uvCol = (srcCol / 2) * uvPixelStride
+                val u = (uBuf.get(uvRow + uvCol).toInt() and 0xFF) - 128
+                val v = (vBuf.get(uvRow + uvCol).toInt() and 0xFF) - 128
+
+                // YUV → RGB
+                val r = (y + 1.370705f * v).toInt().coerceIn(0, 255)
+                val g = (y - 0.698001f * v - 0.337633f * u).toInt().coerceIn(0, 255)
+                val b = (y + 1.732446f * u).toInt().coerceIn(0, 255)
+
+                pixels[dstRow * dstW + dstCol] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
 
-        val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, w, h, null)
-        val out = java.io.ByteArrayOutputStream()
-        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, w, h), 90, out)
-        val bytes = out.toByteArray()
-        return android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            .copy(Bitmap.Config.ARGB_8888, true)
+        val bitmap = Bitmap.createBitmap(dstW, dstH, Bitmap.Config.ARGB_8888)
+        bitmap.setPixels(pixels, 0, dstW, 0, 0, dstW, dstH)
+        return bitmap
+    }
+
+    fun subsequenceDTW(
+        doctorSeq: List<FloatArray>,   // 完整标准动作序列
+        patientSeq: List<FloatArray>,  // 包含多余部分的患者序列
+        windowRatio: Float = 0.15f
+    ): SubDTWResult {
+        val n = doctorSeq.size   // 医生帧数
+        val m = patientSeq.size  // 患者帧数
+
+        if (n == 0 || m == 0) return SubDTWResult(Float.MAX_VALUE, 0, 0)
+
+        val window = (maxOf(n, m) * windowRatio).toInt().coerceAtLeast(abs(n - m) + 1)
+
+        val dp = Array(n + 1) { FloatArray(m + 1) { Float.MAX_VALUE } }
+        val pathLen = Array(n + 1) { IntArray(m + 1) { 0 } }
+
+        // ✅ 关键改动1：第0行全部初始化为0
+        // 含义：医生从第0帧开始，可以从患者任意位置j开始匹配
+        for (j in 0..m) dp[0][j] = 0f
+
+        for (i in 1..n) {
+            val jStart = maxOf(1, i - window)
+            val jEnd = minOf(m, i + window)
+            for (j in jStart..jEnd) {
+                val cost = vectorDistance(doctorSeq[i - 1], patientSeq[j - 1])
+
+                val d1 = dp[i - 1][j]
+                val d2 = dp[i][j - 1]
+                val d3 = dp[i - 1][j - 1]
+                val minVal = minOf(d1, d2, d3)
+
+                if (minVal == Float.MAX_VALUE) continue
+
+                dp[i][j] = cost + minVal
+                pathLen[i][j] = when (minVal) {
+                    d3 -> pathLen[i - 1][j - 1] + 1
+                    d1 -> pathLen[i - 1][j] + 1
+                    else -> pathLen[i][j - 1] + 1
+                }
+            }
+        }
+
+        // ✅ 关键改动2：找医生全部匹配完（第n行）时，患者的最优结束位置
+        var bestEnd = -1
+        var bestCost = Float.MAX_VALUE
+        for (j in 1..m) {
+            if (dp[n][j] < bestCost) {
+                bestCost = dp[n][j]
+                bestEnd = j
+            }
+        }
+
+        if (bestEnd == -1 || bestCost == Float.MAX_VALUE) {
+            return SubDTWResult(Float.MAX_VALUE, 0, m)
+        }
+
+        // ✅ 回溯找患者起始帧
+        val patientStart = backtrackStart(dp, pathLen, n, bestEnd)
+
+        val avgDiff = bestCost / pathLen[n][bestEnd].coerceAtLeast(1)
+
+        Log.d("mmmmm", "医生: $n 帧，患者总: $m 帧")
+        Log.d("mmmmm", "最优匹配段：患者第 $patientStart ~ $bestEnd 帧")
+        Log.d("mmmmm", "平均角度差: %.1f°".format(avgDiff))
+
+        return SubDTWResult(avgDiff, patientStart, bestEnd)
+    }
+
+    /**
+     * 回溯找患者起始帧
+     * 从 dp[n][bestEnd] 往左上角回溯，直到 dp[0][j] 为止
+     */
+    private fun backtrackStart(
+        dp: Array<FloatArray>,
+        pathLen: Array<IntArray>,
+        n: Int,
+        bestEnd: Int
+    ): Int {
+        var i = n
+        var j = bestEnd
+        while (i > 0) {
+            val d1 = dp[i - 1][j]
+            val d2 = if (j > 0) dp[i][j - 1] else Float.MAX_VALUE
+            val d3 = if (j > 0) dp[i - 1][j - 1] else Float.MAX_VALUE
+            val minVal = minOf(d1, d2, d3)
+            when (minVal) {
+                d3 -> {
+                    i--; j--
+                }
+
+                d1 -> i--
+                else -> j--
+            }
+        }
+        // 此时 i=0，j 就是患者的起始帧索引
+        return j
     }
 
     // ── 生命周期 ──────────────────────────────────────────────────────────────
