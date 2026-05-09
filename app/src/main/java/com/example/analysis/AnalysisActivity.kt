@@ -22,6 +22,7 @@ import androidx.core.graphics.drawable.toDrawable
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import io.github.sceneview.math.Color
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -45,6 +46,13 @@ data class DTWResult(
     val maxAngleDiff: Float,
     val errorFrameRatio: Float,  // 超过阈值的帧占比（0~1）
     val errorThreshold: Float    // 使用的阈值
+)
+
+// ✅ 新增数据类（放在文件顶部 SubDTWResult 旁边）
+data class FrameResult(
+    val result: com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult,
+    val width: Int,
+    val height: Int
 )
 
 class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListener {
@@ -95,13 +103,24 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     val doctorPoseList = mutableListOf<List<NormalizedLandmark>>()
     val patientPoseList = mutableListOf<List<NormalizedLandmark>>()
 
-
+    // 帧时间戳 → 骨骼结果缓存（Key单位：毫秒）
+    // ✅ 成员变量区替换原来的 doctorFrameCache/patientFrameCache
+    val doctorFrameCache = java.util.TreeMap<Long, FrameResult>()
+    val patientFrameCache = java.util.TreeMap<Long, FrameResult>()
+    private var doctorFrameIndex = 0L
+    private var patientFrameIndex = 0L
 
     var endedCount = 0
 
     private var lastFrameTsDoctor = 0L
     private var lastFrameTsPatient = 0L
-    // ✅ 新增
+
+    private var playbackStartMs = 0L
+    private var playbackSeekPosMs = 0L
+
+    private var doctorAnalysisStartMs = 0L
+    private var patientAnalysisStartMs = 0L
+
     private val seekBarHandler = Handler(android.os.Looper.getMainLooper())
     private var seekBarRunnable: Runnable? = null
 
@@ -154,17 +173,19 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
             }
 
             override fun onStopTrackingTouch(seekBar: SeekBar) {
-                // 手指抬起：四个播放器同步跳转
                 val posMs = seekBar.progress.toLong()
                 videoViewDoctor.seekTo(posMs.toInt())
                 videoViewPatient.seekTo(posMs.toInt())
-                exoPlayerDoctor?.seekTo(posMs)
-                exoPlayerPatient?.seekTo(posMs)
-                // 恢复播放 + 重启自动更新
                 videoViewDoctor.start()
                 videoViewPatient.start()
-                exoPlayerDoctor?.play()
-                exoPlayerPatient?.play()
+
+                playbackSeekPosMs = posMs
+                playbackStartMs = System.currentTimeMillis()
+
+                // ✅ 直接用视频时间查缓存
+                updateOverlayFromCache(posMs, overlayDoctor, doctorFrameCache)
+                updateOverlayFromCache(posMs, overlayPatient, patientFrameCache)
+
                 startSeekBarUpdate()
             }
         })
@@ -225,10 +246,14 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         stopSeekBarUpdate()
         seekBarRunnable = object : Runnable {
             override fun run() {
-                if (videoViewDoctor.isPlaying) {
-                    sb.progress = videoViewDoctor.currentPosition
-                }
-                seekBarHandler.postDelayed(this, 300)
+                // ✅ 直接用 VideoView 的播放位置查缓存（key 和 currentPosition 单位一致，都是视频相对毫秒）
+                val currentMs = videoViewDoctor.currentPosition.toLong()
+                sb.progress = currentMs.toInt()
+
+                updateOverlayFromCache(currentMs, overlayDoctor, doctorFrameCache)
+                updateOverlayFromCache(currentMs, overlayPatient, patientFrameCache)
+
+                seekBarHandler.postDelayed(this, 100)
             }
         }
         seekBarHandler.post(seekBarRunnable!!)
@@ -237,6 +262,27 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     private fun stopSeekBarUpdate() {
         seekBarRunnable?.let { seekBarHandler.removeCallbacks(it) }
         seekBarRunnable = null
+    }
+
+    /**
+     * 根据当前播放时间从缓存中找最近帧，更新骨骼覆盖层
+     */
+    private fun updateOverlayFromCache(
+        videoMs: Long,  // ← 改名，含义更清晰
+        overlay: OverlayView,
+        cache: java.util.TreeMap<Long, FrameResult>
+    ) {
+        if (cache.isEmpty()) return
+        val entry = cache.floorEntry(videoMs) ?: cache.firstEntry()
+        entry?.value?.let { frameResult ->
+            overlay.setResults(
+                frameResult.result,
+                frameResult.height,
+                frameResult.width,
+                RunningMode.IMAGE
+            )
+            overlay.invalidate()
+        }
     }
 
     // ── 通用分析方法，doctor/patient 共用 ─────────────────────────────────────
@@ -330,6 +376,21 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                         if (isDoctor) doctorPoseList.add(landmarks[0])
                         else patientPoseList.add(landmarks[0])
                     }
+
+                    // ✅ 用视频相对时间作为key（系统时间 - 分析开始时间）
+                    val videoRelativeMs = if (isDoctor) {
+                        System.currentTimeMillis() - doctorAnalysisStartMs
+                    } else {
+                        System.currentTimeMillis() - patientAnalysisStartMs
+                    }
+
+                    if (isDoctor) {
+                        doctorFrameCache[videoRelativeMs] = FrameResult(result.results[0], bitmap.width, bitmap.height)
+                    } else {
+                        patientFrameCache[videoRelativeMs] = FrameResult(result.results[0], bitmap.width, bitmap.height)
+                    }
+
+
                     runOnUiThread {
                         overlay.setResults(
                             result.results[0],
@@ -368,6 +429,10 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                     volume = 0f
                     prepare()
                     play()
+
+                    if (isDoctor) doctorAnalysisStartMs = System.currentTimeMillis()
+                    else patientAnalysisStartMs = System.currentTimeMillis()
+
                     addListener(object : androidx.media3.common.Player.Listener {
                         override fun onPlaybackStateChanged(state: Int) {
                             if (state == androidx.media3.common.Player.STATE_ENDED) {
@@ -642,15 +707,23 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         btnStart.visibility=View.GONE
         btnLoadDoctor.visibility=View.GONE
         btnLoadPatient.visibility=View.GONE
-        val durationMs = videoViewDoctor.duration
+
+        // ✅ 用 ExoPlayer 获取时长，VideoView 结束后 duration 可能不准
+        val durationMs = exoPlayerDoctor?.duration ?: videoViewDoctor.duration.toLong()
         if (durationMs > 0) {
-            sb.max = durationMs
+            sb.max = durationMs.toInt()
             sb.progress = 0
         }
+
         videoViewDoctor.seekTo(0)
         videoViewPatient.seekTo(0)
-        exoPlayerDoctor?.seekTo(0)
-        exoPlayerPatient?.seekTo(0)
+        videoViewDoctor.start()   // ✅ 确保 VideoView 从头播放
+        videoViewPatient.start()
+
+        // ✅ 初始化起点，必须在 startSeekBarUpdate 之前
+        playbackSeekPosMs = 0L
+        playbackStartMs = System.currentTimeMillis()
+
         startSeekBarUpdate()
 
         tvScore.text=totalScore.toString()
