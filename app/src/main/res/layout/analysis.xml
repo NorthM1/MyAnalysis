@@ -20,7 +20,7 @@
 
 
     <VideoView
-        android:layout_marginTop="50dp"
+        android:layout_marginTop="10dp"
         android:id="@+id/video_view_patient"
         android:layout_width="wrap_content"
         android:layout_height="200dp"
@@ -39,25 +39,132 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="开始分析"
-        app:layout_constraintTop_toBottomOf="@id/video_view_patient"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintEnd_toStartOf="@+id/btn_load_doctor"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/video_view_patient" />
 
     <Button
         android:id="@+id/btn_load_doctor"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="导入医生视频"
-        app:layout_constraintTop_toBottomOf="@id/video_view_patient"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent"/>
+        app:layout_constraintEnd_toStartOf="@+id/btn_load_patient"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toEndOf="@+id/btn_start"
+        app:layout_constraintTop_toBottomOf="@id/video_view_patient" />
 
     <Button
         android:id="@+id/btn_load_patient"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="导入患者视频"
-        app:layout_constraintTop_toBottomOf="@id/video_view_patient"
-        app:layout_constraintEnd_toEndOf="parent"/>
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toEndOf="@+id/btn_load_doctor"
+        app:layout_constraintTop_toBottomOf="@id/video_view_patient" />
 
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/cl_score"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingHorizontal="16dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/btn_start">
+
+        <TextView
+            android:id="@+id/tv_score_title"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="本次评分"
+            android:textColor="#666666"
+            android:textSize="14sp"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <TextView
+            android:id="@+id/tv_score"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:includeFontPadding="false"
+            android:text="82"
+            android:textColor="#111111"
+            android:textSize="48sp"
+            android:textStyle="bold"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/tv_score_title" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:layout_marginBottom="8dp"
+            android:text="分"
+            android:textColor="#333333"
+            android:textSize="14sp"
+            app:layout_constraintBottom_toBottomOf="@id/tv_score"
+            app:layout_constraintStart_toEndOf="@id/tv_score" />
+
+        <!-- "良好" 标签 (建议在 drawable 中定义圆角背景 bg_badge_green) -->
+        <TextView
+            android:id="@+id/tv_result"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="#E8F5E9"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="6dp"
+            android:text="良好"
+            android:textColor="#2E7D32"
+            android:textSize="14sp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <TextView
+            android:id="@+id/tv_nums"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="共 8 个分段"
+            android:textColor="#888888"
+            android:textSize="12sp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/tv_result" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <LinearLayout
+        android:id="@+id/ll_seekbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="12dp"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@+id/cl_score">
+
+        <!-- 播放图标 -->
+        <ImageView
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:src="@android:drawable/ic_media_play"
+            app:tint="#666666" />
+
+        <SeekBar
+            android:id="@+id/seek_bar"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:progress="35"
+            android:progressTint="#26A69A"
+            android:thumbTint="#26A69A" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="0:14 / 0:40"
+            android:textColor="#666666"
+            android:textSize="12sp" />
+    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

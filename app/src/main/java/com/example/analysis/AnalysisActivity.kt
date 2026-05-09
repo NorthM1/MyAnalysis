@@ -9,14 +9,20 @@ import android.os.HandlerThread
 import android.util.Log
 import android.view.View
 import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.SeekBar
+import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.media3.common.Player
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.constraintlayout.widget.ConstraintSet
+import androidx.core.graphics.drawable.toDrawable
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import io.github.sceneview.math.Color
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import kotlin.math.abs
@@ -34,6 +40,12 @@ data class SubDTWResult(
     val patientEnd: Int        // 患者最优结束帧
 )
 
+data class DTWResult(
+    val avgAngleDiff: Float,
+    val maxAngleDiff: Float,
+    val errorFrameRatio: Float,  // 超过阈值的帧占比（0~1）
+    val errorThreshold: Float    // 使用的阈值
+)
 
 class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListener {
 
@@ -45,6 +57,12 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     private lateinit var btnLoadDoctor: Button
     private lateinit var btnLoadPatient: Button
     private lateinit var btnStart: Button
+    private lateinit var tvScore: TextView
+    private lateinit var sb: SeekBar
+    private lateinit var tvNums: TextView
+    private lateinit var tvResult: TextView
+    private lateinit var clScore: ConstraintLayout
+    private lateinit var llSeekbar: LinearLayout
 
     // ── URI ──────────────────────────────────────────────────────────────────
     private var doctorUri: Uri? = null
@@ -67,8 +85,6 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
 
     // ── 降帧控制（两路各自记录上次处理时间）──────────────────────────────────
     private val FRAME_INTERVAL_MS = 100L   // 每100ms处理一帧 ≈ 10fps，可按需调整
-    private var lastFrameTimeDoctor = 0L
-    private var lastFrameTimePatient = 0L
 
     var isPaused = false
     private var isPickingFile = false
@@ -79,7 +95,15 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     val doctorPoseList = mutableListOf<List<NormalizedLandmark>>()
     val patientPoseList = mutableListOf<List<NormalizedLandmark>>()
 
+
+
     var endedCount = 0
+
+    private var lastFrameTsDoctor = 0L
+    private var lastFrameTsPatient = 0L
+    // ✅ 新增
+    private val seekBarHandler = Handler(android.os.Looper.getMainLooper())
+    private var seekBarRunnable: Runnable? = null
 
     private val pickVideo =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
@@ -105,8 +129,45 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         btnLoadDoctor = findViewById(R.id.btn_load_doctor)
         btnLoadPatient = findViewById(R.id.btn_load_patient)
         btnStart = findViewById(R.id.btn_start)
+        tvScore=findViewById(R.id.tv_score)
+        tvNums=findViewById(R.id.tv_nums)
+        tvResult=findViewById(R.id.tv_result)
+        sb=findViewById(R.id.seek_bar)
+        clScore=findViewById(R.id.cl_score)
+        llSeekbar=findViewById(R.id.ll_seekbar)
 
         btnStart.isEnabled = false
+
+        // ✅ 新增 SeekBar 监听
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onStartTrackingTouch(seekBar: SeekBar) {
+                // 手指按下：停止自动更新，暂停视频
+                stopSeekBarUpdate()
+                videoViewDoctor.pause()
+                videoViewPatient.pause()
+                exoPlayerDoctor?.pause()
+                exoPlayerPatient?.pause()
+            }
+
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                // 拖动过程中不触发跳转，避免频繁 seekTo 卡顿
+            }
+
+            override fun onStopTrackingTouch(seekBar: SeekBar) {
+                // 手指抬起：四个播放器同步跳转
+                val posMs = seekBar.progress.toLong()
+                videoViewDoctor.seekTo(posMs.toInt())
+                videoViewPatient.seekTo(posMs.toInt())
+                exoPlayerDoctor?.seekTo(posMs)
+                exoPlayerPatient?.seekTo(posMs)
+                // 恢复播放 + 重启自动更新
+                videoViewDoctor.start()
+                videoViewPatient.start()
+                exoPlayerDoctor?.play()
+                exoPlayerPatient?.play()
+                startSeekBarUpdate()
+            }
+        })
 
         btnLoadDoctor.setOnClickListener {
             isPickingFile = true
@@ -160,6 +221,24 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         btnStart.isEnabled = doctorUri != null && patientUri != null
     }
 
+    private fun startSeekBarUpdate() {
+        stopSeekBarUpdate()
+        seekBarRunnable = object : Runnable {
+            override fun run() {
+                if (videoViewDoctor.isPlaying) {
+                    sb.progress = videoViewDoctor.currentPosition
+                }
+                seekBarHandler.postDelayed(this, 300)
+            }
+        }
+        seekBarHandler.post(seekBarRunnable!!)
+    }
+
+    private fun stopSeekBarUpdate() {
+        seekBarRunnable?.let { seekBarHandler.removeCallbacks(it) }
+        seekBarRunnable = null
+    }
+
     // ── 通用分析方法，doctor/patient 共用 ─────────────────────────────────────
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private fun runDetectionOnVideo(
@@ -173,20 +252,6 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
             setVideoURI(uri)
             setOnPreparedListener { it.setVolume(0f, 0f); it.start() }
             requestFocus()
-        }
-
-        videoView.setOnClickListener {
-            isPaused = if (videoView.isPlaying) {
-                videoView.pause()
-                exoPlayerDoctor?.pause()
-                exoPlayerPatient?.pause()
-                true
-            } else {
-                videoView.start()
-                exoPlayerDoctor?.play()
-                exoPlayerPatient?.play()
-                false
-            }
         }
 
         // 在后台线程初始化对应的 PoseLandmarkerHelper
@@ -239,25 +304,27 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         imageReader.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
-                val now = System.currentTimeMillis()
-                // 根据是否是 doctor 读取/更新各自的时间戳
-                val lastTime = if (isDoctor) lastFrameTimeDoctor else lastFrameTimePatient
-                if (isPaused || now - lastTime < FRAME_INTERVAL_MS) return@setOnImageAvailableListener
+                val timestampUs = image.timestamp / 1000
+                val lastTs = if (isDoctor) lastFrameTsDoctor else lastFrameTsPatient
 
-                // 更新时间戳
+                // ✅ 用视频时间戳控制帧率
+                if (isPaused || timestampUs - lastTs < FRAME_INTERVAL_MS * 1000) return@setOnImageAvailableListener
+
                 val helper = if (isDoctor) {
-                    lastFrameTimeDoctor = now
                     if (this::poseLandmarkerHelperDoctor.isInitialized) poseLandmarkerHelperDoctor else null
                 } else {
-                    lastFrameTimePatient = now
                     if (this::poseLandmarkerHelperPatient.isInitialized) poseLandmarkerHelperPatient else null
                 }
+                // ✅ helper为null不占用时间窗口
                 helper ?: return@setOnImageAvailableListener
 
-                val bitmap = image.toBitmapScaled(targetWidth = 256)
-                val timestampUs = image.timestamp / 1000
+                // ✅ 确认处理才更新时间戳
+                if (isDoctor) lastFrameTsDoctor = timestampUs
+                else lastFrameTsPatient = timestampUs
 
-                helper.detectVideoFrame(bitmap, System.currentTimeMillis())?.let { result ->
+                val bitmap = image.toBitmapScaled(targetWidth = 256)
+
+                helper.detectVideoFrame(bitmap, timestampUs)?.let { result ->
                     val landmarks = result.results[0].landmarks()
                     if (landmarks.isNotEmpty()) {
                         if (isDoctor) doctorPoseList.add(landmarks[0])
@@ -271,8 +338,10 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                             RunningMode.IMAGE
                         )
                         overlay.invalidate()
+                        bitmap.recycle()
                     }
-                }
+                } ?: bitmap.recycle()
+
             } finally {
                 image.close()
             }
@@ -305,6 +374,8 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                                 endedCount++
                                 if (endedCount == 2) {  // 两路都结束
                                     val score = calculateScoreDTW(doctorPoseList, patientPoseList)
+                                    tvScore.text="$score"
+
                                     Log.d("mmmmm", "" + score)
                                 }
                                 imageReader.close()
@@ -360,10 +431,10 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
 //            Triple(12, 11,  0), // 颈部角：右肩-左肩-鼻子（头部左右偏）
 
             // ── 下半身（如需要可开启）────────────────────────────────────────────────
-            Triple(23, 25, 27), // 左膝角：左髋-左膝-左踝（膝盖弯曲程度）
-            Triple(24, 26, 28), // 右膝角：右髋-右膝-右踝（膝盖弯曲程度）
-            Triple(11, 23, 25), // 左髋角：左肩-左髋-左膝（髋部弯曲程度）
-            Triple(12, 24, 26), // 右髋角：右肩-右髋-右膝（髋部弯曲程度）
+//            Triple(23, 25, 27), // 左膝角：左髋-左膝-左踝（膝盖弯曲程度）
+//            Triple(24, 26, 28), // 右膝角：右髋-右膝-右踝（膝盖弯曲程度）
+//            Triple(11, 23, 25), // 左髋角：左肩-左髋-左膝（髋部弯曲程度）
+//            Triple(12, 24, 26), // 右髋角：右肩-右髋-右膝（髋部弯曲程度）
 //             Triple(25, 27, 31), // 左踝角：左膝-左踝-左脚尖（踝关节角度）
 //             Triple(26, 28, 32), // 右踝角：右膝-右踝-右脚尖（踝关节角度）
         )
@@ -393,137 +464,226 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     fun dtwWithWindow(
         seq1: List<FloatArray>,
         seq2: List<FloatArray>,
-        windowRatio: Float = 0.15f
-    ): Float {
+        windowRatio: Float = 0.15f,
+        errorThreshold: Float = 15f  // ✅ 可修改的偏差阈值
+    ): DTWResult {
         val n = seq1.size
         val m = seq2.size
-        val window = (maxOf(n, m) * windowRatio).toInt().coerceAtLeast(1)
+
+        if (n == 0 || m == 0) return DTWResult(Float.MAX_VALUE, Float.MAX_VALUE, 1f, errorThreshold)
+
+        val minWindow = abs(n - m) + 1
+        val window = maxOf(minWindow, (maxOf(n, m) * windowRatio).toInt())
 
         val dp = Array(n + 1) { FloatArray(m + 1) { Float.MAX_VALUE } }
+        val pathLen = Array(n + 1) { IntArray(m + 1) { 0 } }
+        val costMap = Array(n + 1) { FloatArray(m + 1) { 0f } }
         dp[0][0] = 0f
 
         for (i in 1..n) {
-            // Band 约束：j 的范围限制在窗口内
             val jStart = maxOf(1, i - window)
             val jEnd = minOf(m, i + window)
             for (j in jStart..jEnd) {
                 val cost = vectorDistance(seq1[i - 1], seq2[j - 1])
-                val minPrev = minOf(
-                    dp[i - 1][j],
-                    dp[i][j - 1],
-                    dp[i - 1][j - 1]
-                )
-                if (minPrev < Float.MAX_VALUE) {
-                    dp[i][j] = cost + minPrev
+                costMap[i][j] = cost
+
+                val d1 = dp[i - 1][j]
+                val d2 = dp[i][j - 1]
+                val d3 = dp[i - 1][j - 1]
+                val minVal = minOf(d1, d2, d3)
+
+                if (minVal == Float.MAX_VALUE) continue
+
+                dp[i][j] = cost + minVal
+                pathLen[i][j] = when (minVal) {
+                    d3 -> pathLen[i - 1][j - 1] + 1
+                    d1 -> pathLen[i - 1][j] + 1
+                    else -> pathLen[i][j - 1] + 1
                 }
             }
         }
 
-        // 归一化：除以对角路径长度
-        val pathLen = (n + m).toFloat()
-        return dp[n][m] / pathLen
+        if (dp[n][m] == Float.MAX_VALUE) return DTWResult(Float.MAX_VALUE, Float.MAX_VALUE, 1f, errorThreshold)
+
+        // 回溯最优路径，收集每帧的cost
+        val pathCosts = mutableListOf<Float>()
+        var i = n; var j = m
+        while (i > 0 && j > 0) {
+            pathCosts.add(costMap[i][j])
+            val d1 = dp[i - 1][j]
+            val d2 = if (j > 0) dp[i][j - 1] else Float.MAX_VALUE
+            val d3 = if (i > 0 && j > 0) dp[i - 1][j - 1] else Float.MAX_VALUE
+            val minVal = minOf(d1, d2, d3)
+            when (minVal) {
+                d3 -> { i--; j-- }
+                d1 -> i--
+                else -> j--
+            }
+        }
+
+//        val actualPathLen = pathLen[n][m].coerceAtLeast(1)
+//        val avgDiff = dp[n][m] / actualPathLen
+        val avgDiff = dp[n][m] / (n + m).toFloat()
+        val maxDiff = pathCosts.maxOrNull() ?: avgDiff
+        val errorFrameRatio = pathCosts.count { it > errorThreshold }.toFloat() / pathCosts.size.coerceAtLeast(1)
+
+        return DTWResult(avgDiff, maxDiff, errorFrameRatio, errorThreshold)
     }
 
+    /**
+     * 对角度序列做滑动窗口平滑
+     * 在 extractAngleVector 之后、DTW 之前调用
+     */
+    fun smoothAngleSeq(
+        seq: List<FloatArray>,
+        windowSize: Int = 3
+    ): List<FloatArray> {
+        if (seq.size < windowSize) return seq
+        val half = windowSize / 2
+        return seq.mapIndexed { idx, _ ->
+            val start = (idx - half).coerceAtLeast(0)
+            val end = (idx + half + 1).coerceAtMost(seq.size)
+            val window = seq.subList(start, end)
+            val jointCount = seq[0].size
+            FloatArray(jointCount) { j ->
+                // ✅ 取中值而不是平均值
+                val values = window.map { it[j] }.sorted()
+                values[values.size / 2]
+            }
+        }
+    }
 
-    //    /**
-//     * 最终评分入口
-//     */
-//    fun calculateScoreDTW(
-//        doctorList: List<List<NormalizedLandmark>>,
-//        patientList: List<List<NormalizedLandmark>>
-//    ): Int {
-//        // 1. 提取角度序列
-//        val seq1 = doctorList.map { extractAngleVector(it) }
-//        val seq2 = patientList.map { extractAngleVector(it) }
-//
-//        // 2. 计算 DTW 归一化距离（单位：平均角度差°）
-//        val avgAngleDiff = dtwWithWindow(seq1, seq2, windowRatio = 0.15f)
-//
-//        // 3. 映射到分数
-//        //    avgAngleDiff = 0°  → 100分（完美）
-//        //    avgAngleDiff = 30° → 0分（差异很大）
-//        //    可根据实际数据调整 maxDiff
-//        val maxDiff = 30f
-//        val score = ((1f - avgAngleDiff / maxDiff) * 100f)
-//            .coerceIn(0f, 100f)
-//            .toInt()
-//
-//        return score
-//    }
     fun calculateScoreDTW(
         doctorList: List<List<NormalizedLandmark>>,
         patientList: List<List<NormalizedLandmark>>
     ): Int {
         if (doctorList.isEmpty() || patientList.isEmpty()) return 0
 
-        val doctorSeq = doctorList.map { extractAngleVector(it) }
-        val patientSeq = patientList.map { extractAngleVector(it) }
+        val doctorSeqRaw = doctorList.map { extractAngleVector(it) }
+        val patientSeqRaw = patientList.map { extractAngleVector(it) }
 
-        // 第一步：找到患者有效段
+        // ✅ 平滑处理
+        val doctorSeq = smoothAngleSeq(doctorSeqRaw, windowSize = 3)
+        val patientSeq = smoothAngleSeq(patientSeqRaw, windowSize = 3)
+
+        // ── 第一步：全局subsequenceDTW，找患者有效段 ──────────────────────────
         val subResult = subsequenceDTW(doctorSeq, patientSeq, windowRatio = 0.15f)
         if (subResult.avgAngleDiff == Float.MAX_VALUE) return 0
 
-        // 提取患者有效段
         val validPatientSeq = patientSeq.subList(subResult.patientStart, subResult.patientEnd)
 
-        Log.d("mmmmm", "患者有效段：第${subResult.patientStart}~${subResult.patientEnd}帧，共${validPatientSeq.size}帧")
+        Log.d("mmmmm", "═══════════════════════════════════")
+        Log.d("mmmmm", "医生: ${doctorSeq.size}帧，患者总: ${patientSeq.size}帧")
+        Log.d("mmmmm", "最优匹配段：患者第 ${subResult.patientStart} ~ ${subResult.patientEnd} 帧")
+        Log.d("mmmmm", "平均角度差: ${"%.1f".format(subResult.avgAngleDiff)}°")
+        Log.d("mmmmm", "═══════════════════════════════════")
 
-        // 第二步：按5秒切块评分
-        // 采样率 20fps（FRAME_INTERVAL_MS=50ms），5秒=100帧
+        // ── 第二步：全局对齐路径，用于动态切块 ───────────────────────────────
+        // 在医生序列和患者有效段之间建立帧级对应关系
+        val alignment = getAlignmentPath(doctorSeq, validPatientSeq, windowRatio = 0.15f)
+
+        Log.d("mmmmm", "全局路径回溯完成，医生${doctorSeq.size}帧 → 患者有效段${validPatientSeq.size}帧")
+
+        // ── 第三步：按医生帧切块，患者边界从alignment取 ──────────────────────
         val framesPerSegment = (5000 / FRAME_INTERVAL_MS).toInt()
-
         val segmentScores = mutableListOf<Int>()
         var segIndex = 0
 
         while (true) {
-            // 医生序列的切块范围
             val doctorStart = segIndex * framesPerSegment
             val doctorEnd = minOf(doctorStart + framesPerSegment, doctorSeq.size)
             if (doctorStart >= doctorSeq.size) break
 
-            // 患者有效段按比例映射到对应范围
-            // 医生第 doctorStart~doctorEnd 帧 对应 患者有效段的哪个范围
-            val ratio = validPatientSeq.size.toFloat() / doctorSeq.size
-            val patStart = (doctorStart * ratio).toInt().coerceIn(0, validPatientSeq.size)
-            val patEnd = (doctorEnd * ratio).toInt().coerceIn(0, validPatientSeq.size)
+            // ✅ 从全局路径取患者边界，完全消除速度影响
+            val patStart = alignment[doctorStart]
+            val patEnd = (alignment[doctorEnd - 1] + 1).coerceAtMost(validPatientSeq.size)
 
             if (patStart >= patEnd || doctorStart >= doctorEnd) {
-                segIndex++
-                continue
+                segIndex++; continue
             }
 
             val doctorChunk = doctorSeq.subList(doctorStart, doctorEnd)
             val patientChunk = validPatientSeq.subList(patStart, patEnd)
 
-            // 对这段单独跑DTW评分
-            val avgDiff = dtwWithWindow(doctorChunk, patientChunk, windowRatio = 0.15f)
-            val segScore = if (avgDiff == Float.MAX_VALUE) 0
-            else ((1f - avgDiff / 30f) * 100f).coerceIn(0f, 100f).toInt()
+            // ✅ 分段内窗口放大到0.3，吸收局部速度抖动
+            val dtwResult = dtwWithWindow(doctorChunk, patientChunk, windowRatio = 0.3f, errorThreshold = 15f)
+
+            val segScore = if (dtwResult.avgAngleDiff == Float.MAX_VALUE) 0
+            else ((1f - dtwResult.avgAngleDiff / 30f) * 100f).coerceIn(0f, 100f).toInt()
 
             segmentScores.add(segScore)
 
+            // 保留原有详细Log
             val segStartSec = segIndex * 5
             val segEndSec = segStartSec + 5
-            Log.d("mmmmm", "第${segIndex + 1}段 (${segStartSec}s~${segEndSec}s): $segScore 分，角度差=%.1f°".format(avgDiff))
+            Log.d("mmmmm", "───────────────────────────────────")
+            Log.d("mmmmm", "第${segIndex + 1}段 (${segStartSec}s ~ ${segEndSec}s)")
+            Log.d("mmmmm", "  得分:       $segScore 分")
+            Log.d("mmmmm", "  平均偏差:   ${"%.1f".format(dtwResult.avgAngleDiff)}°")
+            Log.d("mmmmm", "  最大偏差:   ${"%.1f".format(dtwResult.maxAngleDiff)}°")
+            Log.d("mmmmm", "  超${dtwResult.errorThreshold.toInt()}°帧占比: ${"%.1f".format(dtwResult.errorFrameRatio * 100)}%")
+            Log.d("mmmmm", "  医生帧范围: $doctorStart ~ $doctorEnd（${doctorEnd - doctorStart}帧）")
+            Log.d("mmmmm", "  患者帧范围: $patStart ~ $patEnd（${patEnd - patStart}帧）")
 
             segIndex++
         }
 
         if (segmentScores.isEmpty()) return 0
 
-        // 第三步：汇总
+        // ── 第四步：汇总 ──────────────────────────────────────────────────────
         val totalScore = segmentScores.average().toInt()
+        Log.d("mmmmm", "═══════════════════════════════════")
         Log.d("mmmmm", "分段明细: $segmentScores")
         Log.d("mmmmm", "最终总分: $totalScore")
+        Log.d("mmmmm", "═══════════════════════════════════")
+
+        clScore.visibility=View.VISIBLE
+        llSeekbar.visibility=View.VISIBLE
+        btnStart.visibility=View.GONE
+        btnLoadDoctor.visibility=View.GONE
+        btnLoadPatient.visibility=View.GONE
+        val durationMs = videoViewDoctor.duration
+        if (durationMs > 0) {
+            sb.max = durationMs
+            sb.progress = 0
+        }
+        videoViewDoctor.seekTo(0)
+        videoViewPatient.seekTo(0)
+        exoPlayerDoctor?.seekTo(0)
+        exoPlayerPatient?.seekTo(0)
+        startSeekBarUpdate()
+
+        tvScore.text=totalScore.toString()
+        tvNums.text="共 ${segIndex} 个分段"
+        tvResult.apply{
+            when{
+                totalScore>85 ->{
+                    text="优秀"
+                    background= android.graphics.Color.parseColor("#FFE8F5E9").toDrawable()
+                    setTextColor(android.graphics.Color.parseColor("#FF2E7D32"))
+                }
+                totalScore>75 ->{
+                    text="良好"
+                    background= android.graphics.Color.parseColor("#FFFFF3E0").toDrawable()
+                    setTextColor(android.graphics.Color.parseColor("#FFE65100"))
+                }
+                else -> {
+                    text="需改进"
+                    background= android.graphics.Color.parseColor("#FFFFEBEE").toDrawable()
+                    setTextColor(android.graphics.Color.parseColor("#FFC62828"))
+                }
+            }
+        }
+
 
         return totalScore
     }
 
     // 计算三点夹角（角度）
     fun angle(a: NormalizedLandmark, b: NormalizedLandmark, c: NormalizedLandmark): Float {
-        val v1x = a.x() - b.x();
+        val v1x = a.x() - b.x()
         val v1y = a.y() - b.y()
-        val v2x = c.x() - b.x();
+        val v2x = c.x() - b.x()
         val v2y = c.y() - b.y()
         val dot = v1x * v2x + v1y * v2y
         val mag = sqrt((v1x * v1x + v1y * v1y) * (v2x * v2x + v2y * v2y))
@@ -681,6 +841,55 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         return j
     }
 
+    /**
+     * 全局DTW路径回溯
+     * 返回 alignment[i] = 医生第i帧对应的患者帧索引
+     */
+    fun getAlignmentPath(
+        seq1: List<FloatArray>,
+        seq2: List<FloatArray>,
+        windowRatio: Float = 0.15f
+    ): IntArray {
+        val n = seq1.size
+        val m = seq2.size
+        val minWindow = abs(n - m) + 1
+        val window = maxOf(minWindow, (maxOf(n, m) * windowRatio).toInt())
+
+        val dp = Array(n + 1) { FloatArray(m + 1) { Float.MAX_VALUE } }
+        dp[0][0] = 0f
+
+        for (i in 1..n) {
+            val jStart = maxOf(1, i - window)
+            val jEnd = minOf(m, i + window)
+            for (j in jStart..jEnd) {
+                val cost = vectorDistance(seq1[i - 1], seq2[j - 1])
+                val minVal = minOf(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+                if (minVal < Float.MAX_VALUE) dp[i][j] = cost + minVal
+            }
+        }
+
+        // 回溯路径，记录每个医生帧(i)对应的患者帧(j)
+        val alignment = IntArray(n)
+        var i = n; var j = m
+
+        while (i > 0 && j > 0) {
+            alignment[i - 1] = j - 1
+            val d1 = dp[i - 1][j]
+            val d2 = dp[i][j - 1]
+            val d3 = dp[i - 1][j - 1]
+            val minVal = minOf(d1, d2, d3)
+            when (minVal) {
+                d3 -> { i--; j-- }
+                d1 -> i--
+                else -> j--
+            }
+        }
+        // 填充路径起始未被回溯到的帧
+        while (i > 0) { alignment[i - 1] = 0; i-- }
+
+        return alignment
+    }
+
     // ── 生命周期 ──────────────────────────────────────────────────────────────
     override fun onPause() {
         if (!isPickingFile) {
@@ -702,6 +911,9 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         imageReaderPatient?.close(); imageReaderPatient = null
         analysisThreadDoctor?.quitSafely(); analysisThreadDoctor = null
         analysisThreadPatient?.quitSafely(); analysisThreadPatient = null
+
+        stopSeekBarUpdate()
+
         super.onDestroy()
     }
 
