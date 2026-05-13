@@ -10,6 +10,7 @@ import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.RelativeLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -19,6 +20,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.constraintlayout.widget.ConstraintSet
 import androidx.core.graphics.drawable.toDrawable
+import androidx.recyclerview.widget.RecyclerView
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -28,6 +30,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import kotlin.math.abs
 import kotlin.math.acos
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
@@ -55,6 +58,15 @@ data class FrameResult(
     val height: Int
 )
 
+data class SegmentItem(
+    val index: Int,
+    val startSec: Int,
+    val endSec: Int,
+    val score: Int,
+    val doctorStartMs: Long,
+    val patientStartMs: Long
+)
+
 class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListener {
 
     // ── UI ───────────────────────────────────────────────────────────────────
@@ -71,6 +83,11 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     private lateinit var tvResult: TextView
     private lateinit var clScore: ConstraintLayout
     private lateinit var llSeekbar: LinearLayout
+    private lateinit var rl: RelativeLayout
+    private lateinit var rv: RecyclerView
+
+    private val segmentItems = mutableListOf<SegmentItem>()
+    private lateinit var segmentAdapter: SegmentAdapter
 
     // ── URI ──────────────────────────────────────────────────────────────────
     private var doctorUri: Uri? = null
@@ -117,6 +134,9 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
 
     private var playbackStartMs = 0L
     private var playbackSeekPosMs = 0L
+    // 患者有效段起始时间（毫秒）
+    private var patientValidStartMs = 0L
+    private var patientValidEndMs = 0L
 
     private var doctorAnalysisStartMs = 0L
     private var patientAnalysisStartMs = 0L
@@ -154,6 +174,8 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         sb=findViewById(R.id.seek_bar)
         clScore=findViewById(R.id.cl_score)
         llSeekbar=findViewById(R.id.ll_seekbar)
+        rl=findViewById(R.id.rl)
+        rv=findViewById(R.id.rv)
 
         btnStart.isEnabled = false
 
@@ -220,9 +242,13 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
             doctorUri ?: return@setOnClickListener
             patientUri ?: return@setOnClickListener
             btnStart.isEnabled = false
+            btnStart.visibility=View.GONE
+            btnLoadDoctor.visibility=View.GONE
+            btnLoadPatient.visibility=View.GONE
 
             // 两路同时启动分析
             backgroundExecutor = Executors.newSingleThreadScheduledExecutor()
+            //backgroundExecutor = Executors.newScheduledThreadPool(2)
             runDetectionOnVideo(
                 uri = doctorUri!!,
                 videoView = videoViewDoctor,
@@ -250,8 +276,10 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                 val currentMs = videoViewDoctor.currentPosition.toLong()
                 sb.progress = currentMs.toInt()
 
-                updateOverlayFromCache(currentMs, overlayDoctor, doctorFrameCache)
-                updateOverlayFromCache(currentMs, overlayPatient, patientFrameCache)
+                // ✅ 骨骼提前2帧显示，补偿渲染延迟（1帧=100ms，2帧=200ms）
+                val skeletonMs = (currentMs + FRAME_INTERVAL_MS * 10).coerceAtMost(sb.max.toLong())
+                updateOverlayFromCache(skeletonMs, overlayDoctor, doctorFrameCache)
+                updateOverlayFromCache(skeletonMs, overlayPatient, patientFrameCache)
 
                 seekBarHandler.postDelayed(this, 100)
             }
@@ -325,9 +353,14 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
                 ?: 480
         retriever.release()
 
-        // ImageReader
+        // ✅ 限制最大480p，ExoPlayer会自动缩放输出
+        val maxReaderWidth = 480
+        val readerScale = minOf(1f, maxReaderWidth.toFloat() / videoWidth)
+        val readerWidth = (videoWidth * readerScale).toInt()
+        val readerHeight = (videoHeight * readerScale).toInt()
+
         val imageReader = android.media.ImageReader.newInstance(
-            videoWidth, videoHeight, android.graphics.ImageFormat.YUV_420_888, 2
+            readerWidth, readerHeight, android.graphics.ImageFormat.YUV_420_888, 2
         )
         val analysisThread = HandlerThread(
             if (isDoctor) "VideoAnalysis-Doctor" else "VideoAnalysis-Patient"
@@ -472,34 +505,34 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
     fun extractAngleVector(frame: List<NormalizedLandmark>): FloatArray {
         val joints = listOf(
             // ── 手臂 ──────────────────────────────────────────────────────────────────
-            Triple(11, 13, 15), // 左肘角：左肩-左肘-左腕（手臂弯曲程度）
-            Triple(12, 14, 16), // 右肘角：右肩-右肘-右腕（手臂弯曲程度）
+//            Triple(11, 13, 15), // 左肘角：左肩-左肘-左腕（手臂弯曲程度）
+//            Triple(12, 14, 16), // 右肘角：右肩-右肘-右腕（手臂弯曲程度）
 //            Triple(13, 15, 17), // 左腕角：左肘-左腕-左小指（手腕弯曲）
 //            Triple(14, 16, 18), // 右腕角：右肘-右腕-右小指（手腕弯曲）
 //            Triple(13, 15, 19), // 左腕角：左肘-左腕-左食指（手腕弯曲）
 //            Triple(14, 16, 20), // 右腕角：右肘-右腕-右食指（手腕弯曲）
 
             // ── 肩部 ──────────────────────────────────────────────────────────────────
-            Triple(23, 11, 13), // 左肩纵向角：左髋-左肩-左肘（手臂前后抬起幅度）
-            Triple(24, 12, 14), // 右肩纵向角：右髋-右肩-右肘（手臂前后抬起幅度）
-            Triple(12, 11, 13), // 左肩横向角：右肩-左肩-左肘（手臂左右展开幅度）
-            Triple(11, 12, 14), // 右肩横向角：左肩-右肩-右肘（手臂左右展开幅度）
+//            Triple(23, 11, 13), // 左肩纵向角：左髋-左肩-左肘（手臂前后抬起幅度）
+//            Triple(24, 12, 14), // 右肩纵向角：右髋-右肩-右肘（手臂前后抬起幅度）
+//            Triple(12, 11, 13), // 左肩横向角：右肩-左肩-左肘（手臂左右展开幅度）
+//            Triple(11, 12, 14), // 右肩横向角：左肩-右肩-右肘（手臂左右展开幅度）
 
             // ── 躯干 ──────────────────────────────────────────────────────────────────
-            Triple(11, 23, 24), // 左躯干角：左肩-左髋-右髋（上身左侧倾斜）
-            Triple(12, 24, 23), // 右躯干角：右肩-右髋-左髋（上身右侧倾斜）
-            Triple(11, 12, 24), // 肩髋角右：左肩-右肩-右髋（躯干扭转）
-            Triple(12, 11, 23), // 肩髋角左：右肩-左肩-左髋（躯干扭转）
+//            Triple(11, 23, 24), // 左躯干角：左肩-左髋-右髋（上身左侧倾斜）
+//            Triple(12, 24, 23), // 右躯干角：右肩-右髋-左髋（上身右侧倾斜）
+//            Triple(11, 12, 24), // 肩髋角右：左肩-右肩-右髋（躯干扭转）
+//            Triple(12, 11, 23), // 肩髋角左：右肩-左肩-左髋（躯干扭转）
 
 //            // ── 颈部/头部 ─────────────────────────────────────────────────────────────
 //            Triple(11, 12,  0), // 颈部角：左肩-右肩-鼻子（头部前后倾）
 //            Triple(12, 11,  0), // 颈部角：右肩-左肩-鼻子（头部左右偏）
 
             // ── 下半身（如需要可开启）────────────────────────────────────────────────
-//            Triple(23, 25, 27), // 左膝角：左髋-左膝-左踝（膝盖弯曲程度）
-//            Triple(24, 26, 28), // 右膝角：右髋-右膝-右踝（膝盖弯曲程度）
-//            Triple(11, 23, 25), // 左髋角：左肩-左髋-左膝（髋部弯曲程度）
-//            Triple(12, 24, 26), // 右髋角：右肩-右髋-右膝（髋部弯曲程度）
+            Triple(23, 25, 27), // 左膝角：左髋-左膝-左踝（膝盖弯曲程度）
+            Triple(24, 26, 28), // 右膝角：右髋-右膝-右踝（膝盖弯曲程度）
+            Triple(11, 23, 25), // 左髋角：左肩-左髋-左膝（髋部弯曲程度）
+            Triple(12, 24, 26), // 右髋角：右肩-右髋-右膝（髋部弯曲程度）
 //             Triple(25, 27, 31), // 左踝角：左膝-左踝-左脚尖（踝关节角度）
 //             Triple(26, 28, 32), // 右踝角：右膝-右踝-右脚尖（踝关节角度）
         )
@@ -618,6 +651,54 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         }
     }
 
+    // ── 运动复杂度计算 ─────────────────────────────────────
+    /**
+     * 计算某段医生序列的运动复杂度（各关节角度标准差的均方根）
+     * 用于加权汇总：动作幅度越大的分段权重越高
+     * @param chunk  该段的角度向量列表
+     * @return 复杂度值（>= 1.0）
+     */
+    fun computeComplexity(chunk: List<FloatArray>): Float {
+        if (chunk.size < 2) return 1f
+        val jointCount = chunk[0].size
+        var totalVariance = 0f
+        for (j in 0 until jointCount) {
+            val mean = chunk.map { it[j] }.average().toFloat()
+            val variance = chunk.map { v -> (v[j] - mean) * (v[j] - mean) }
+                .average().toFloat()
+            totalVariance += variance
+        }
+        return kotlin.math.sqrt(totalVariance / jointCount) + 1f  // +1 平滑项
+    }
+
+    // ── 多指标加权分段得分 ───────────────────────────────────
+    /**
+     * 多指标加权评分模型
+     * S_avg  = max(0, 1 - (avgAngleDiff/30)^1.5) * 100   权重 0.5
+     * S_err  = (1 - errorFrameRatio) * 100                权重 0.3
+     * S_max  = max(0, 1 - maxAngleDiff/90) * 100          权重 0.2
+     */
+    fun computeSegmentScore(dtwResult: DTWResult): Int {
+        if (dtwResult.avgAngleDiff == Float.MAX_VALUE) return 0
+
+        // ① 平均偏差子分：非线性幂函数，alpha=1.5
+        val ratio1 = (dtwResult.avgAngleDiff / 30f).coerceAtMost(1f)
+        val sAvg = (1f - ratio1.toDouble().pow(1.5)).coerceAtLeast(0.0).toFloat() * 100f
+
+        // ② 超阈值帧占比子分：线性
+        val sErr = (1f - dtwResult.errorFrameRatio) * 100f
+
+        // ③ 最大偏差子分：线性，上限90度
+        val sMax = (1f - dtwResult.maxAngleDiff / 90f).coerceIn(0f, 1f) * 100f
+
+        // ④ 加权综合
+        return (0.5f * sAvg + 0.3f * sErr + 0.2f * sMax)
+            .coerceIn(0f, 100f).toInt()
+    }
+
+
+    val complexityWeights = mutableListOf<Float>()      //  各段复杂度权重
+
     fun calculateScoreDTW(
         doctorList: List<List<NormalizedLandmark>>,
         patientList: List<List<NormalizedLandmark>>
@@ -636,6 +717,9 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         if (subResult.avgAngleDiff == Float.MAX_VALUE) return 0
 
         val validPatientSeq = patientSeq.subList(subResult.patientStart, subResult.patientEnd)
+        // ✅ 保存患者有效段的时间偏移
+        patientValidStartMs = subResult.patientStart * FRAME_INTERVAL_MS
+        patientValidEndMs = subResult.patientEnd * FRAME_INTERVAL_MS
 
         Log.d("mmmmm", "═══════════════════════════════════")
         Log.d("mmmmm", "医生: ${doctorSeq.size}帧，患者总: ${patientSeq.size}帧")
@@ -673,10 +757,15 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
             // ✅ 分段内窗口放大到0.3，吸收局部速度抖动
             val dtwResult = dtwWithWindow(doctorChunk, patientChunk, windowRatio = 0.3f, errorThreshold = 15f)
 
-            val segScore = if (dtwResult.avgAngleDiff == Float.MAX_VALUE) 0
-            else ((1f - dtwResult.avgAngleDiff / 30f) * 100f).coerceIn(0f, 100f).toInt()
+            // 使用多指标加权评分替换原简单线性评分
+            val segScore = computeSegmentScore(dtwResult)
+
+            // 计算该段医生序列的运动复杂度作为权重
+            val complexity = computeComplexity(doctorChunk)
 
             segmentScores.add(segScore)
+            complexityWeights.add(complexity)
+
 
             // 保留原有详细Log
             val segStartSec = segIndex * 5
@@ -696,17 +785,26 @@ class AnalysisActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerLis
         if (segmentScores.isEmpty()) return 0
 
         // ── 第四步：汇总 ──────────────────────────────────────────────────────
-        val totalScore = segmentScores.average().toInt()
+        val weightSum = complexityWeights.sum().coerceAtLeast(1e-6f)
+        val totalScore = segmentScores.zip(complexityWeights)
+            .sumOf { (score, w) -> score * w.toDouble() }
+            .div(weightSum)
+            .toInt()
+            .coerceIn(0, 100)
+
         Log.d("mmmmm", "═══════════════════════════════════")
         Log.d("mmmmm", "分段明细: $segmentScores")
         Log.d("mmmmm", "最终总分: $totalScore")
         Log.d("mmmmm", "═══════════════════════════════════")
+
 
         clScore.visibility=View.VISIBLE
         llSeekbar.visibility=View.VISIBLE
         btnStart.visibility=View.GONE
         btnLoadDoctor.visibility=View.GONE
         btnLoadPatient.visibility=View.GONE
+        rl.visibility=View.VISIBLE
+        rv.visibility=View.VISIBLE
 
         // ✅ 用 ExoPlayer 获取时长，VideoView 结束后 duration 可能不准
         val durationMs = exoPlayerDoctor?.duration ?: videoViewDoctor.duration.toLong()
